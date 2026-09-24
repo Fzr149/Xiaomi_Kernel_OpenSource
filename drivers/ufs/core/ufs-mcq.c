@@ -277,6 +277,45 @@ static void ufshcd_mcq_process_cqe(struct ufs_hba *hba,
 	struct cq_entry *cqe = ufshcd_mcq_cur_cqe(hwq);
 	int tag = ufshcd_mcq_get_tag(hba, hwq, cqe);
 
+#if IS_ENABLED(CONFIG_MTK_UFS_DEBUG)
+	struct ufshcd_lrb *lrbp;
+	bool err_dump = false;
+
+	/* Error handlder in progress */
+	if (hba->eh_flags & (1 << 0))
+		goto skip_check;
+
+	if ((tag >=0) && (tag < hba->nutrs)) {
+		lrbp = &hba->lrb[tag];
+
+		/* Something wrong if tag is valid but not complete */
+		if (!lrbp->cmd &&
+		    (lrbp->command_type != UTP_CMD_TYPE_DEV_MANAGE) &&
+		    (lrbp->command_type != UTP_CMD_TYPE_UFS_STORAGE))
+			err_dump = true;
+	}
+
+	if (!cqe->command_desc_base_addr || (tag >= hba->nutrs) || err_dump) {
+		/* Check if HW DMA update wrong data */
+		dev_err(hba->dev,
+			"Invalid cqe->command_desc_base_addr=0x%llx, tag=%d\n",
+			cqe->command_desc_base_addr, tag);
+
+		/* Check if DRAM is corrupt */
+		dev_err(hba->dev, "cq_head_slot:0x%x\n, cqe_base_addr:0x%llx, cqe:0x%llx, ucdl_dma_addr:0x%llx",
+			hwq->cq_head_slot,
+			(unsigned long long) hwq->cqe_base_addr,
+			(unsigned long long) cqe, hba->ucdl_dma_addr);
+
+		ufshcd_vops_dbg_register_dump(hba);
+
+		BUG_ON(1);
+	}
+
+skip_check:
+
+#endif
+
 	if (cqe->command_desc_base_addr) {
 		ufshcd_compl_one_cqe(hba, tag, cqe);
 		/* After processed the cqe, mark it empty (invalid) entry */
@@ -632,13 +671,6 @@ int ufshcd_mcq_abort(struct scsi_cmnd *cmd)
 	unsigned long flags;
 	int err;
 
-	if (!ufshcd_cmd_inflight(lrbp->cmd)) {
-		dev_err(hba->dev,
-			"%s: skip abort. cmd at tag %d already completed.\n",
-			__func__, tag);
-		return FAILED;
-	}
-
 	/* Skip task abort in case previous aborts failed and report failure */
 	if (lrbp->req_abort_skip) {
 		dev_err(hba->dev, "%s: skip abort. tag %d failed earlier\n",
@@ -647,6 +679,11 @@ int ufshcd_mcq_abort(struct scsi_cmnd *cmd)
 	}
 
 	hwq = ufshcd_mcq_req_to_hwq(hba, scsi_cmd_to_rq(cmd));
+	if (!hwq) {
+		dev_err(hba->dev, "%s: skip abort. cmd at tag %d already completed.\n",
+			__func__, tag);
+		return FAILED;
+	}
 
 	if (ufshcd_mcq_sqe_search(hba, hwq, tag)) {
 		/*

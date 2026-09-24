@@ -387,6 +387,9 @@ struct ufs_hba_variant_ops {
 				       unsigned long *ocqs);
 	int	(*config_esi)(struct ufs_hba *hba);
 	void	(*config_scsi_dev)(struct scsi_device *sdev);
+#if IS_ENABLED(CONFIG_MTK_UFS_DEBUG_BUILD)
+	void    (*check_bus_status)(struct ufs_hba *hba);
+#endif
 };
 
 /* clock gating state  */
@@ -704,6 +707,9 @@ enum ufshcd_android_quirks {
 
 	/* Set IID to one. */
 	UFSHCD_ANDROID_QUIRK_SET_IID_TO_ONE		= 1 << 30,
+
+	/* Do not read IS after H8 enter */
+	UFSHCD_ANDROID_QUIRK_NO_IS_READ_ON_H8		= 1 << 31,
 };
 
 enum ufshcd_caps {

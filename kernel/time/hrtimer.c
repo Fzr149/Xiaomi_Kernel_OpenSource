@@ -49,6 +49,9 @@
 #include <trace/hooks/syscall_check.h>
 
 #include "tick-internal.h"
+#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
+#include <linux/sched/clock.h>
+#endif
 
 /*
  * Masks for selecting the soft and hard context timers from
@@ -158,11 +161,6 @@ static struct hrtimer_cpu_base migration_cpu_base = {
 };
 
 #define migration_base	migration_cpu_base.clock_base[0]
-
-static inline bool is_migration_base(struct hrtimer_clock_base *base)
-{
-	return base == &migration_base;
-}
 
 /*
  * We are using hashed locking: holding per_cpu(hrtimer_bases)[n].lock
@@ -319,11 +317,6 @@ again:
 }
 
 #else /* CONFIG_SMP */
-
-static inline bool is_migration_base(struct hrtimer_clock_base *base)
-{
-	return false;
-}
 
 static inline struct hrtimer_clock_base *
 lock_hrtimer_base(const struct hrtimer *timer, unsigned long *flags)
@@ -1441,6 +1434,18 @@ static void hrtimer_sync_wait_running(struct hrtimer_cpu_base *cpu_base,
 	}
 }
 
+#ifdef CONFIG_SMP
+static __always_inline bool is_migration_base(struct hrtimer_clock_base *base)
+{
+	return base == &migration_base;
+}
+#else
+static __always_inline bool is_migration_base(struct hrtimer_clock_base *base)
+{
+	return false;
+}
+#endif
+
 /*
  * This function is called on PREEMPT_RT kernels when the fast path
  * deletion of a timer failed because the timer callback function was
@@ -1705,15 +1710,24 @@ EXPORT_SYMBOL_GPL(hrtimer_active);
  * a false negative if the read side got smeared over multiple consecutive
  * __run_hrtimer() invocations.
  */
-
+#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
+void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
+			  struct hrtimer_clock_base *base,
+			  struct hrtimer *timer, ktime_t *now,
+			  unsigned long flags) __must_hold(&cpu_base->lock)
+#else
 static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 			  struct hrtimer_clock_base *base,
 			  struct hrtimer *timer, ktime_t *now,
 			  unsigned long flags) __must_hold(&cpu_base->lock)
+#endif
 {
 	enum hrtimer_restart (*fn)(struct hrtimer *);
 	bool expires_in_hardirq;
 	int restart;
+#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
+	u64 start, end, process_time;
+#endif
 
 	lockdep_assert_held(&cpu_base->lock);
 
@@ -1748,9 +1762,17 @@ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
 	trace_hrtimer_expire_entry(timer, now);
 	expires_in_hardirq = lockdep_hrtimer_enter(timer);
-
+#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
+	start = sched_clock();
+#endif
 	restart = fn(timer);
-
+#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
+	end = sched_clock();
+	process_time = end - start;
+	if (process_time > 5000000L) // > 5ms
+		pr_notice("irq_monitor: function: %pS time: %lld func: %s line: %d "
+			, fn, process_time, __func__, __LINE__);
+#endif
 	lockdep_hrtimer_exit(expires_in_hardirq);
 	trace_hrtimer_expire_exit(timer);
 	raw_spin_lock_irq(&cpu_base->lock);
@@ -1995,7 +2017,11 @@ void hrtimer_run_queues(void)
 /*
  * Sleep related functions:
  */
+#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
+enum hrtimer_restart hrtimer_wakeup(struct hrtimer *timer)
+#else
 static enum hrtimer_restart hrtimer_wakeup(struct hrtimer *timer)
+#endif
 {
 	struct hrtimer_sleeper *t =
 		container_of(timer, struct hrtimer_sleeper, timer);
@@ -2153,14 +2179,9 @@ long hrtimer_nanosleep(ktime_t rqtp, const enum hrtimer_mode mode,
 	struct restart_block *restart;
 	struct hrtimer_sleeper t;
 	int ret = 0;
-	u64 slack;
-
-	slack = current->timer_slack_ns;
-	if (rt_task(current))
-		slack = 0;
 
 	hrtimer_init_sleeper_on_stack(&t, clockid, mode);
-	hrtimer_set_expires_range_ns(&t.timer, rqtp, slack);
+	hrtimer_set_expires_range_ns(&t.timer, rqtp, current->timer_slack_ns);
 	ret = do_nanosleep(&t, mode);
 	if (ret != -ERESTART_RESTARTBLOCK)
 		goto out;
@@ -2343,7 +2364,7 @@ void __init hrtimers_init(void)
 /**
  * schedule_hrtimeout_range_clock - sleep until timeout
  * @expires:	timeout value (ktime_t)
- * @delta:	slack in expires timeout (ktime_t) for SCHED_OTHER tasks
+ * @delta:	slack in expires timeout (ktime_t)
  * @mode:	timer mode
  * @clock_id:	timer clock to be used
  */
@@ -2370,13 +2391,6 @@ schedule_hrtimeout_range_clock(ktime_t *expires, u64 delta,
 		return -EINTR;
 	}
 
-	/*
-	 * Override any slack passed by the user if under
-	 * rt contraints.
-	 */
-	if (rt_task(current))
-		delta = 0;
-
 	hrtimer_init_sleeper_on_stack(&t, clock_id, mode);
 	hrtimer_set_expires_range_ns(&t.timer, *expires, delta);
 	hrtimer_sleeper_start_expires(&t, mode);
@@ -2396,7 +2410,7 @@ EXPORT_SYMBOL_GPL(schedule_hrtimeout_range_clock);
 /**
  * schedule_hrtimeout_range - sleep until timeout
  * @expires:	timeout value (ktime_t)
- * @delta:	slack in expires timeout (ktime_t) for SCHED_OTHER tasks
+ * @delta:	slack in expires timeout (ktime_t)
  * @mode:	timer mode
  *
  * Make the current task sleep until the given expiry time has
